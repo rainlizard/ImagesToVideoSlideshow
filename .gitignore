@@ -1,0 +1,13 @@
+venv/
+test/
+output/
+ffmpeg/
+build/
+*.webm
+*.mp4
+*.json
+*.log
+ImagesToVideoSlideshow.exe
+ffmpeg.exe
+ffmpeg
+delete_local_tags.bat

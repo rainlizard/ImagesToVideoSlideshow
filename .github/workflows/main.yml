@@ -1,0 +1,199 @@
+# .github/workflows/create_release.yml
+name: Create Release Build
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build_and_package:
+    name: Build Executable and Packages
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with: { fetch-depth: 0 }
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with: { python-version: '3.10' }
+
+    - name: Extract Version Info from Tag
+      id: version_info
+      run: |
+        $tag = $env:GITHUB_REF_NAME
+        if (-not $tag.StartsWith("v")) { throw "Tag does not start with 'v': $tag" }
+        $fullVersion = $tag.Substring(1)
+        $appName = "ImagesToVideoSlideshow"
+        $winExeBaseName = "$appName-$fullVersion"
+
+        $outputs = @{
+          TAG_NAME=$tag
+          WIN_EXE_BASENAME=$winExeBaseName
+          WIN_PY_PACKAGE_NAME="$appName-$fullVersion-python-win64.zip"
+          LINUX_PY_PACKAGE_NAME="$appName-$fullVersion-python-linux.zip"
+          FULL_VERSION=$fullVersion
+        }
+
+        $outputs.GetEnumerator() | ForEach-Object {
+          echo "$($_.Name)=$($_.Value)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        }
+      shell: pwsh
+
+    - name: Update Version in main.py
+      run: |
+        $filePath = "main.py"
+        $newVersion = "${{ steps.version_info.outputs.FULL_VERSION }}"
+        $pattern = '^(VERSION\s*=\s*").*(")' # Pattern to find the line (Group 1: prefix, Group 2: suffix)
+
+        Write-Host "--- Initial State ---"
+        Get-Content $filePath -Encoding utf8 | Select-String -Pattern '^VERSION\s*='
+        Write-Host "---------------------"
+
+        Write-Host "Attempting to update VERSION in $filePath to $newVersion"
+        # Read line by line, replace if match, otherwise keep original
+        $updatedLines = @()
+        $matchFound = $false
+        Get-Content $filePath -Encoding utf8 | ForEach-Object {
+          if ($_ -match $pattern) {
+            Write-Host "Match found on line: $_"
+            # Construct the new line using the -f format operator for safety
+            $updatedLine = '{0}{1}{2}' -f $matches[1], $newVersion, $matches[2]
+            $updatedLines += $updatedLine
+            Write-Host "Replaced with: $updatedLine"
+            $matchFound = $true
+          } else {
+            $updatedLines += $_
+          }
+        }
+
+        if (-not $matchFound) {
+          Write-Host "WARNING: Pattern '$pattern' did not match any line in $filePath."
+          # Optional: Consider failing the job if the version isn't found
+          # exit 1
+        }
+
+        # Write the modified content back
+        try {
+          Set-Content -Path $filePath -Value $updatedLines -Encoding utf8 -ErrorAction Stop
+          Write-Host "Set-Content executed successfully."
+        } catch {
+          Write-Host "ERROR during Set-Content: $_"
+          exit 1 # Fail the step if writing failed
+        }
+
+        Write-Host "--- Verification after update: ---"
+        Get-Content $filePath -Encoding utf8 | Select-String -Pattern '^VERSION\s*='
+        Write-Host "---------------------------------"
+      shell: pwsh
+
+    - name: Get pip cache dir
+      id: pip_cache
+      run: |
+        echo "dir=$(pip cache dir)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      shell: pwsh
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.pip_cache.outputs.dir }}
+        key: ${{ runner.os }}-python-3.10-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-python-3.10-
+          ${{ runner.os }}-python-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip pyinstaller
+        if (-not (Test-Path requirements.txt)) { throw "requirements.txt not found." }
+        pip install -r requirements.txt
+      shell: pwsh
+
+    - name: Extract Windows FFmpeg binary
+      run: |
+        $ffmpegZip = "ffmpeg-windows.zip"
+        $tempDir = "./ffmpeg_temp_win"
+        if (-not (Test-Path $ffmpegZip)) { throw "$ffmpegZip not found." }
+        Expand-Archive -Path $ffmpegZip -DestinationPath $tempDir -Force
+        $ffmpegExe = Get-ChildItem -Path $tempDir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+        if (-not $ffmpegExe) { throw "ffmpeg.exe not found in $ffmpegZip." }
+        Move-Item -Path $ffmpegExe.FullName -Destination ./ffmpeg.exe -Force
+        Remove-Item -Path $tempDir -Recurse -Force
+      shell: pwsh
+
+    - name: Extract Linux FFmpeg binary
+      run: |
+        $ffmpegZip = "ffmpeg-linux.zip"
+        $targetName = "ffmpeg_linux_binary"
+        $tempDir = "./ffmpeg_temp_linux"
+        if (-not (Test-Path $ffmpegZip)) { throw "$ffmpegZip not found." }
+        Expand-Archive -Path $ffmpegZip -DestinationPath $tempDir -Force
+        $ffmpegLinuxExe = Get-ChildItem -Path $tempDir -Recurse -Filter ffmpeg | Where-Object { $_.Name -eq 'ffmpeg' -and !$_.PSIsContainer } | Select-Object -First 1
+        if (-not $ffmpegLinuxExe) { throw "Linux 'ffmpeg' executable not found in $ffmpegZip." }
+        Move-Item -Path $ffmpegLinuxExe.FullName -Destination "./$targetName" -Force
+        Remove-Item -Path $tempDir -Recurse -Force
+      shell: pwsh
+
+    - name: Build Windows Executable with PyInstaller
+      run: |
+        if (-not (Test-Path icon.png)) { throw "icon.png not found." }
+        if (-not (Test-Path ffmpeg.exe)) { throw "Windows ffmpeg.exe not prepared." }
+        pyinstaller --noconfirm --onefile --windowed `
+          --add-data "icon.png;." `
+          --add-binary "ffmpeg.exe;." `
+          --name "${{ steps.version_info.outputs.WIN_EXE_BASENAME }}" `
+          --collect-all tkinterdnd2 `
+          --hidden-import "PIL.ImageTk" `
+          $(if (Test-Path icon.ico) { "--icon=icon.ico" } else { "" }) `
+          main.py
+      shell: pwsh
+
+    - name: Package Python Files for Windows and Linux
+      run: |
+        $commonFiles = "main.py", "requirements.txt", "icon.png"
+        $subFolderName = "ImagesToVideoSlideshow"
+
+        $winPkgDir = "package-win-py"
+        $winPkgSubDir = "$winPkgDir/$subFolderName"
+        $winFfmpeg = "./ffmpeg.exe"; if (-not (Test-Path $winFfmpeg)) { throw "$winFfmpeg not found." }
+        New-Item -ItemType Directory -Path $winPkgSubDir -Force | Out-Null
+        $winFilesToCopy = $commonFiles + "start.bat"
+        Copy-Item -Path $winFilesToCopy -Destination $winPkgSubDir
+        Copy-Item -Path $winFfmpeg -Destination "$winPkgSubDir/ffmpeg.exe"
+        Compress-Archive -Path "$winPkgDir/*" -DestinationPath "${{ steps.version_info.outputs.WIN_PY_PACKAGE_NAME }}" -Force
+        Remove-Item -Path $winPkgDir -Recurse -Force
+
+        $linuxPkgDir = "package-linux-py"
+        $linuxPkgSubDir = "$linuxPkgDir/$subFolderName"
+        $linuxFfmpeg = "./ffmpeg_linux_binary"; if (-not (Test-Path $linuxFfmpeg)) { throw "Linux ffmpeg binary $linuxFfmpeg not found." }
+        New-Item -ItemType Directory -Path $linuxPkgSubDir -Force | Out-Null
+        $linuxFilesToCopy = $commonFiles + "start.sh"
+        Copy-Item -Path $linuxFilesToCopy -Destination $linuxPkgSubDir
+        Copy-Item -Path $linuxFfmpeg -Destination "$linuxPkgSubDir/ffmpeg"
+        Compress-Archive -Path "$linuxPkgDir/*" -DestinationPath "${{ steps.version_info.outputs.LINUX_PY_PACKAGE_NAME }}" -Force
+        Remove-Item -Path $linuxPkgDir -Recurse -Force
+      shell: pwsh
+
+    - name: Create and Upload GitHub Release Assets
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        $tagName = "${{ steps.version_info.outputs.TAG_NAME }}"
+        $winExeAsset = "dist/${{ steps.version_info.outputs.WIN_EXE_BASENAME }}.exe"
+        $winPyAsset = "./${{ steps.version_info.outputs.WIN_PY_PACKAGE_NAME }}"
+        $linuxPyAsset = "./${{ steps.version_info.outputs.LINUX_PY_PACKAGE_NAME }}"
+        if (-not (Test-Path $winExeAsset)) { throw "Windows executable asset not found: $winExeAsset" }
+        if (-not (Test-Path $winPyAsset)) { throw "Windows Python package asset not found: $winPyAsset" }
+        if (-not (Test-Path $linuxPyAsset)) { throw "Linux Python package asset not found: $linuxPyAsset" }
+
+        gh release create $tagName `
+          --title "$tagName" `
+          --notes "* Windows: Download the standalone executable (`.exe`), or alternatively the Python package (unzip and run `start.bat`).`n* Linux: Download the Python package (unzip and run `start.sh`)." `
+          "$winExeAsset" `
+          "$winPyAsset" `
+          "$linuxPyAsset"
+      shell: pwsh
